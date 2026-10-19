@@ -31,7 +31,7 @@ jobs:
           echo "Building version: $VERSION"
 
       - name: Download sundtek-driver icon
-        run: wget -O icon.png "https://raw.githubusercontent.com/ich777/mos-templates/master/images/sundtek-driver.png" || wget -O icon.png "https://raw.githubusercontent.com/ich777/mos-templates/master/images/dvb.png"
+        run: wget -O icon.png "https://raw.githubusercontent.com/ich777/docker-templates/master/ich777/images/sundtek.png"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
