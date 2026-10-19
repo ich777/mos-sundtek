@@ -6,119 +6,40 @@
 # Set Variables
 PLG_NAME="sundtek-driver"
 PLG_DIR="/boot/optional/plugins/$PLG_NAME"
-SUNDETK_SCRIPT="$PLG_DIR/sundtek_install.sh"
-CONTAINERS_FILE="/var/lib/docker/mos/containers"
+SUNDETK_SCRIPT_SRC="$PLG_DIR/sundtek_install.sh"
+SUNDETK_SCRIPT="/var/mos/plugins/sundtek-plugins/sundtek_install.sh"
+WRAPPER_SCRIPT_SRC="$PLG_DIR/99-sundtekdriverinstall"
+WRAPPER_SCRIPT="/var/mos/plugins/sundtek-plugins/99-sundtekdriverinstall"
+INSTALL_LOG_DIR="/tmp/sundtek-driver"
+SUNDETK_DIR="/tmp/sundtek"
+SUNDETK_DEVICES_LIST="$SUNDETK_DIR/devices_list"
 
-# Ensure Sundtek install script is downloaded
+# Ensure Sundtek install script is available (download + copy to ext4)
 ensure_sundtek_script() {
-  if [ ! -f "$SUNDETK_SCRIPT" ]; then
+  # Download if not on /boot
+  if [ ! -f "$SUNDETK_SCRIPT_SRC" ]; then
     echo "Downloading Sundtek installation script..."
     mkdir -p "$PLG_DIR"
-    if wget -q -O "$SUNDETK_SCRIPT" "http://sundtek.de/media/sundtek_netinst.sh" 2>/dev/null; then
-      chmod +x "$SUNDETK_SCRIPT"
-      echo "Sundtek installation script downloaded"
+    if wget -q -O "$SUNDETK_SCRIPT_SRC" "http://sundtek.de/media/sundtek_netinst.sh" 2>/dev/null; then
+      sed -i "s/NETINSTALL=1/NETINSTALL=0/g" "$SUNDETK_SCRIPT_SRC"
+      echo "Sundtek installation script downloaded and patched"
     else
       echo "Error: Failed to download Sundtek installation script"
       return 1
     fi
   fi
+
+  # Copy to /var/mos/plugins (ext4, supports +x)
+  mkdir -p /var/mos/plugins/sundtek-plugins
+  cp "$SUNDETK_SCRIPT_SRC" "$SUNDETK_SCRIPT"
+  chmod +x "$SUNDETK_SCRIPT"
 }
 
-# Get container info from containers file
-get_container_info() {
-  local name="$1"
-  if [ -f "$CONTAINERS_FILE" ]; then
-    jq --arg name "$name" '.[] | select(.name == $name)' "$CONTAINERS_FILE"
-  fi
-}
-
-# Get container index from containers file
-get_container_index() {
-  local name="$1"
-  if [ -f "$CONTAINERS_FILE" ]; then
-    jq --arg name "$name" '.[] | select(.name == $name) | .index' "$CONTAINERS_FILE"
-  fi
-}
-
-# List TVHeadend containers (case-insensitive)
-list_tvheadend_containers() {
-  local containers=()
-  if [ -f "$CONTAINERS_FILE" ]; then
-    while IFS= read -r line; do
-      containers+=("$line")
-    done < <(jq -r '.[].name' "$CONTAINERS_FILE" 2>/dev/null)
-  fi
-
-  for name in "${containers[@]}"; do
-    if echo "$name" | grep -qiE 'tvheadend|headend'; then
-      echo "$name"
-    fi
-  done
-}
-
-# Check if container is running
-is_container_running() {
+# Copy Sundtek script to container's /config host path
+copy_script_to_container() {
   local container="$1"
-  local running
-  running=$(docker inspect --format='{{.State.Running}}' "$container" 2>/dev/null)
-  if [ "$running" = "true" ]; then
-    echo "true"
-  else
-    echo "false"
-  fi
-}
-
-# Check if Sundtek driver is already installed in a container
-check_driver_installed() {
-  local container="$1"
-
-  # Container must be running to check
-  if ! is_container_running "$container"; then
-    echo "false"
-    return
-  fi
-
-  local exit_code=0
-  docker exec -i "$container" bash -c 'if [ -e "/usr/bin/tvheadend.bin" ]; then exit 0; fi'
-  exit_code=$?
-  if [ $exit_code -eq 0 ]; then
-    echo "true"
-  else
-    echo "false"
-  fi
-}
-
-# Install driver into a container
-install_driver() {
-  local container="$1"
-
-  # Ensure Sundtek install script is downloaded
-  ensure_sundtek_script
-  if [ $? -ne 0 ]; then
-    return 1
-  fi
-
-  # Check if container is running, start if needed
-  if ! is_container_running "$container"; then
-    echo "Starting container '$container'..."
-    docker start "$container" > /dev/null 2>&1
-    sleep 2
-  fi
-
-  if ! is_container_running "$container"; then
-    echo "Error: Container '$container' is not running"
-    return 1
-  fi
-
-  # Check if driver is already installed
-  if check_driver_installed "$container" | grep -q "true"; then
-    echo "Driver already installed in container '$container'"
-    return 0
-  fi
-
-  # Copy script to container config path
   local config_path
-  config_path=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/config"}}{{.Source}}{{end}}{{end}}' "$container")
+  config_path=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/config"}}{{.Source}}{{end}}{{end}}' "$container" 2>/dev/null)
 
   if [ -z "$config_path" ]; then
     echo "Error: Could not find /config mount for container '$container'"
@@ -128,80 +49,127 @@ install_driver() {
   cp "$SUNDETK_SCRIPT" "${config_path}/sundtek_install.sh"
   chmod +x "${config_path}/sundtek_install.sh"
   chown 99:100 "${config_path}/sundtek_install.sh" 2>/dev/null || true
+  echo "Script copied to $config_path/sundtek_install.sh"
+  return 0
+}
 
-  # Run install script in container
-  echo "Installing Sundtek driver in container '$container'..."
-  docker exec --env AUTO_INST=1 --env NETINSTALL=0 -i "$container" \
-    bash -c '/config/sundtek_install.sh -docker -use-custom-path /config' > /dev/null 2>&1
+# Install driver into container (full flow)
+install_driver() {
+  local container="$1"
+  local log_file="$INSTALL_LOG_DIR/${container}.log"
+  local status_file="$INSTALL_LOG_DIR/${container}.status"
 
-  if [ $? -eq 0 ]; then
-    echo "Driver installed successfully"
-    return 0
+  mkdir -p "$INSTALL_LOG_DIR"
+  echo "" > "$log_file"
+  echo "running" > "$status_file"
+
+  (
+    echo "=== Sundtek Driver Installation: $container ==="
+    echo "Started: $(date)"
+    echo ""
+
+    # Step 1: Ensure Sundtek script is available
+    echo "[1/3] Checking Sundtek installation script..."
+    if ensure_sundtek_script >> "$log_file" 2>&1; then
+      echo "      OK"
+    else
+      echo "      Error: Failed to download Sundtek script"
+      echo "failed" > "$status_file"
+      exit 1
+    fi
+    echo ""
+
+    # Step 2: Copy script to container's /config
+    echo "[2/3] Copying script to container..."
+    # Start container if needed to inspect mounts
+    local running
+    running=$(docker inspect --format='{{.State.Running}}' "$container" 2>/dev/null)
+    if [ "$running" != "true" ]; then
+      echo "      Starting container to access mounts..."
+      docker start "$container" >> "$log_file" 2>&1
+      sleep 2
+    fi
+
+    if copy_script_to_container "$container" >> "$log_file" 2>&1; then
+      echo "      OK"
+    else
+      echo "      Error: Failed to copy script to container"
+      echo "failed" > "$status_file"
+      exit 1
+    fi
+    echo ""
+
+    # Step 3: Done - frontend will configure container via Socket.IO
+    # Container will be recreated and wrapper script will install driver
+    echo "[3/3] Ready for container configuration"
+    echo "      Container will be configured and restarted automatically"
+    echo ""
+
+    echo "=== Preparation completed ==="
+    echo "Finished: $(date)"
+    echo "success" > "$status_file"
+  ) >> "$log_file" 2>&1 &
+
+  local pid=$!
+  echo "$pid" > "$INSTALL_LOG_DIR/${container}.pid"
+  echo "{\"status\":\"started\"}"
+}
+
+# Get install log for a container
+get_install_log() {
+  local container="$1"
+  local log_file="$INSTALL_LOG_DIR/${container}.log"
+
+  if [ -f "$log_file" ]; then
+    cat "$log_file"
   else
-    echo "Driver installation failed"
-    return 1
+    echo "No installation log found"
   fi
 }
 
-# Update driver in a container
-update_driver() {
+# Get install status for a container
+get_install_status() {
   local container="$1"
+  local status_file="$INSTALL_LOG_DIR/${container}.status"
+  local log_file="$INSTALL_LOG_DIR/${container}.log"
 
-  # Ensure Sundtek install script is downloaded
-  ensure_sundtek_script
-  if [ $? -ne 0 ]; then
-    return 1
+  if [ -f "$status_file" ]; then
+    local status
+    status=$(cat "$status_file")
+    local log_size=0
+    if [ -f "$log_file" ]; then
+      log_size=$(wc -c < "$log_file")
+    fi
+    echo "{\"status\":\"$status\",\"log_size\":$log_size}"
+  else
+    echo "{\"status\":\"none\",\"log_size\":0}"
   fi
-
-  # Check if already installed
-  local installed
-  installed=$(check_driver_installed "$container")
-  if [ "$installed" != "true" ]; then
-    echo "Driver not installed yet"
-    return 1
-  fi
-
-  # Re-run install script
-  install_driver "$container"
 }
 
-# Get container status
-get_status() {
-  local container="$1"
-  local running
-  local driver_installed
-
-  # Check if container is running
-  running=$(is_container_running "$container")
-
-  # Check if driver is installed
-  driver_installed=$(check_driver_installed "$container")
-
-  echo "{\"container\":\"$container\",\"running\":$running,\"driver_installed\":$driver_installed}"
-}
-
-# Get list of TVHeadend containers with status
-get_containers_status() {
+# Get list of TVHeadend containers
+get_tvheadend_containers() {
   local containers
-  containers=$(list_tvheadend_containers)
+  containers=$(docker ps --all --format '{{json .}}' 2>/dev/null)
 
-  local result="[]"
-  if [ -n "$containers" ]; then
-    result="["
-    local first=true
-    while IFS= read -r name; do
-      if [ -z "$name" ]; then continue; fi
-      local status
-      status=$(get_status "$name")
+  local result="["
+  local first=true
+  while IFS= read -r line; do
+    if [ -z "$line" ]; then continue; fi
+    local name
+    name=$(echo "$line" | jq -r '.Names[0]' 2>/dev/null | sed 's|^/||')
+    local state
+    state=$(echo "$line" | jq -r '.State' 2>/dev/null)
+
+    if echo "$name" | grep -qiE 'tvheadend|headend'; then
       if [ "$first" = true ]; then
         first=false
       else
         result="$result,"
       fi
-      result="$result$status"
-    done <<< "$containers"
-    result="$result]"
-  fi
+      result="$result{\"name\":\"$name\",\"running\":$([ \"$state\" = \"running\" ] && echo true || echo false)}"
+    fi
+  done <<< "$containers"
+  result="$result]"
 
   echo "$result"
 }
@@ -214,9 +182,12 @@ update_script() {
 
   if wget -q -O "$tmp_file" "http://sundtek.de/media/sundtek_netinst.sh" 2>/dev/null; then
     mkdir -p "$PLG_DIR"
-    cp "$tmp_file" "$SUNDETK_SCRIPT"
+    cp "$tmp_file" "$SUNDETK_SCRIPT_SRC"
+    sed -i "s/NETINSTALL=1/NETINSTALL=0/g" "$SUNDETK_SCRIPT_SRC"
+    mkdir -p /var/mos/plugins/sundtek-plugins
+    cp "$SUNDETK_SCRIPT_SRC" "$SUNDETK_SCRIPT"
     chmod +x "$SUNDETK_SCRIPT"
-    echo "Sundtek script updated"
+    echo "Sundtek script updated and patched"
     rm -f "$tmp_file"
     return 0
   else
@@ -227,14 +198,8 @@ update_script() {
 }
 
 case "$1" in
-  list)
-    list_tvheadend_containers
-    ;;
-  status)
-    get_status "$2"
-    ;;
   containers)
-    get_containers_status
+    get_tvheadend_containers
     ;;
   install)
     if [ -z "$2" ]; then
@@ -243,18 +208,32 @@ case "$1" in
     fi
     install_driver "$2"
     ;;
+  install_log)
+    if [ -z "$2" ]; then
+      echo "Error: Container name required"
+      exit 1
+    fi
+    get_install_log "$2"
+    ;;
+  install_status)
+    if [ -z "$2" ]; then
+      echo "Error: Container name required"
+      exit 1
+    fi
+    get_install_status "$2"
+    ;;
   update)
     if [ -z "$2" ]; then
       echo "Error: Container name required"
       exit 1
     fi
-    update_driver "$2"
+    install_driver "$2"
     ;;
   update_script)
     update_script
     ;;
   *)
-    echo "Usage: $0 {list|status <container>|containers|install <container>|update <container>|update_script}"
+    echo "Usage: $0 {containers|install <container>|install_log <container>|install_status <container>|update <container>|update_script}"
     exit 1
     ;;
 esac
