@@ -1,0 +1,117 @@
+#!/bin/bash
+
+# Import MOS functions
+. /usr/local/lib/functions/mos-common
+
+PLG_NAME="sundtek-driver"
+PLG_DIR="/boot/optional/plugins/$PLG_NAME"
+SUNDETK_SCRIPT_SRC="$PLG_DIR/sundtek_install.sh"
+SUNDETK_SCRIPT="/var/mos/plugins/sundtek-plugins/sundtek_install.sh"
+WRAPPER_SCRIPT_SRC="$PLG_DIR/99-sundtekdriverinstall"
+WRAPPER_SCRIPT="/var/mos/plugins/sundtek-plugins/99-sundtekdriverinstall"
+SUNDETK_DIR="/tmp/sundtek"
+SUNDETK_DEVICES_LIST="$SUNDETK_DIR/devices_list"
+
+install() {
+  # Create plugin directories
+  mkdir -p "$PLG_DIR"
+  mkdir -p /var/mos/plugins/sundtek-plugins
+
+  # Create wrapper script (on /boot for persistence)
+  cat > "$WRAPPER_SCRIPT_SRC" << 'EOF'
+#!/bin/bash
+if [ -e "/usr/bin/tvheadend" ] && [ ! -e "/usr/bin/tvheadend.bin" ]; then
+  AUTO_INST=1 NETINSTALL=0 /config/sundtek_install.sh -docker -use-custom-path /config >/dev/null
+fi
+EOF
+  chmod +x "$WRAPPER_SCRIPT_SRC"
+
+  # Download and patch Sundtek script (on /boot for persistence)
+  if wget -q -O "$SUNDETK_SCRIPT_SRC" "http://sundtek.de/media/sundtek_netinst.sh" 2>/dev/null; then
+    sed -i "s/NETINSTALL=1/NETINSTALL=0/g" "$SUNDETK_SCRIPT_SRC"
+    echo "Sundtek installation script downloaded and patched"
+  else
+    echo "Warning: Failed to download Sundtek installation script"
+  fi
+
+  # Copy scripts to /var/mos/plugins (ext4, supports +x)
+  cp "$SUNDETK_SCRIPT_SRC" "$SUNDETK_SCRIPT"
+  chmod +x "$SUNDETK_SCRIPT"
+  cp "$WRAPPER_SCRIPT_SRC" "$WRAPPER_SCRIPT"
+  chmod +x "$WRAPPER_SCRIPT"
+
+  # Create Sundtek temp directory
+  mkdir -p "$SUNDETK_DIR"
+}
+
+mos_start() {
+  # Ensure /var/mos/plugins/sundtek-plugins exists and scripts are copied
+  mkdir -p /var/mos/plugins/sundtek-plugins
+
+  # Download Sundtek script if not present (retry if install failed)
+  if [ ! -f "$SUNDETK_SCRIPT_SRC" ]; then
+    mkdir -p "$PLG_DIR"
+    wget -q -O "$SUNDETK_SCRIPT_SRC" "http://sundtek.de/media/sundtek_netinst.sh" 2>/dev/null
+    if [ -f "$SUNDETK_SCRIPT_SRC" ]; then
+      sed -i "s/NETINSTALL=1/NETINSTALL=0/g" "$SUNDETK_SCRIPT_SRC"
+    fi
+  fi
+
+  # Copy scripts to /var/mos/plugins (ext4, supports +x)
+  if [ -f "$SUNDETK_SCRIPT_SRC" ]; then
+    cp "$SUNDETK_SCRIPT_SRC" "$SUNDETK_SCRIPT"
+    chmod +x "$SUNDETK_SCRIPT"
+  fi
+  if [ -f "$WRAPPER_SCRIPT_SRC" ]; then
+    cp "$WRAPPER_SCRIPT_SRC" "$WRAPPER_SCRIPT"
+    chmod +x "$WRAPPER_SCRIPT"
+  fi
+
+  # Create /dev/dvb directory
+  mkdir -p "$SUNDETK_DIR" /dev/dvb
+
+  # Count Sundtek USB and PCI adapters
+  local usb_count
+  usb_count=$(lsusb 2>/dev/null | grep -i "sundtek" | wc -l)
+  local pci_count
+  pci_count=$(lspci 2>/dev/null | grep -i "sundtek" | wc -l)
+  local total_sundtek=$((usb_count + pci_count))
+
+  # Count already created devices
+  local existing_count=0
+  if [ -f "$SUNDETK_DEVICES_LIST" ]; then
+    existing_count=$(wc -l < "$SUNDETK_DEVICES_LIST")
+  fi
+
+  # Calculate how many new devices to create
+  local devices_to_create=$((total_sundtek - existing_count))
+  if [ $devices_to_create -lt 0 ]; then
+    devices_to_create=0
+  fi
+
+  # Find first available adapter number
+  local adapter_num=0
+  while [ -d "/dev/dvb/adapter${adapter_num}" ]; do
+    adapter_num=$((adapter_num + 1))
+  done
+
+  # Create dummy DVB device nodes
+  while [ $devices_to_create -gt 0 ]; do
+    mkdir -p "/dev/dvb/adapter${adapter_num}"
+    mknod "/dev/dvb/adapter${adapter_num}/frontend0" c 212 $((adapter_num*6+1)) 2>/dev/null
+    mknod "/dev/dvb/adapter${adapter_num}/dvr0" c 212 $((adapter_num*6+5)) 2>/dev/null
+    mknod "/dev/dvb/adapter${adapter_num}/demux0" c 212 $((adapter_num*6+3)) 2>/dev/null
+    echo "adapter${adapter_num}" >> "$SUNDETK_DEVICES_LIST"
+    devices_to_create=$((devices_to_create - 1))
+    adapter_num=$((adapter_num + 1))
+  done
+
+  # If no Sundtek devices found, create at least one dummy adapter
+  if [ $total_sundtek -eq 0 ] && [ $existing_count -eq 0 ]; then
+    mkdir -p "/dev/dvb/adapter0"
+    mknod "/dev/dvb/adapter0/frontend0" c 212 1 2>/dev/null
+    mknod "/dev/dvb/adapter0/dvr0" c 212 5 2>/dev/null
+    mknod "/dev/dvb/adapter0/demux0" c 212 3 2>/dev/null
+    echo "adapter0" >> "$SUNDETK_DEVICES_LIST"
+  fi
+}
