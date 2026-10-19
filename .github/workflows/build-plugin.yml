@@ -61,10 +61,6 @@ jobs:
           cp sundtek-driver ${PKG_DIR}/usr/bin/plugins/sundtek-driver
           chmod +x ${PKG_DIR}/usr/bin/plugins/sundtek-driver
 
-          # Copy Sundtek install script
-          cp sundtek_install.sh ${PKG_DIR}/usr/bin/plugins/sundtek_install.sh
-          chmod +x ${PKG_DIR}/usr/bin/plugins/sundtek_install.sh
-
           # Copy Vue plugin
           cp -R page/dist/sundtek-driver/* ${PKG_DIR}/var/www/mos-plugins/sundtek-driver/
 
@@ -83,7 +79,6 @@ jobs:
           cat > ${PKG_DIR}/DEBIAN/postinst << 'EOF'
           #!/bin/bash
           chmod +x /usr/bin/plugins/sundtek-driver
-          chmod +x /usr/bin/plugins/sundtek_install.sh
           exit 0
           EOF
           chmod +x ${PKG_DIR}/DEBIAN/postinst
